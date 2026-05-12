@@ -1,0 +1,9 @@
+# Python bytecode caches — OBS generates these when loading scripts
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
