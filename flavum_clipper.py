@@ -398,7 +398,7 @@ def _process_recording(folder):
     _log(f"{folder.name}: {len(cut_list)} cut(s) saved")
 
     if cut_list and _settings["auto_cut"]:
-        _produce_cut_files(folder, recording, cut_list)
+        _produce_cut_files(folder, recording, cut_list, job_id)
 
 
 # ---------------------------------------------------------------------------
@@ -665,7 +665,7 @@ def _pick_video_encoder():
     return _detected_encoder
 
 
-def _produce_cut_files(folder, recording_path, cuts):
+def _produce_cut_files(folder, recording_path, cuts, job_id):
     encoder = _pick_video_encoder()
     encoder_flags = _ENCODER_FLAGS.get(encoder, _ENCODER_FLAGS["libx264"])
 
@@ -703,9 +703,14 @@ def _produce_cut_files(folder, recording_path, cuts):
         produced += 1
 
     _log(f"{produced}/{total} cut(s) saved to {cuts_dir}")
+
+    # Notification body includes both the local cuts folder and the dashboard
+    # URL so the user can either open the files directly or jump into the
+    # rich review UI to play/edit.
+    dashboard_url = f"{_settings['backend_url'].rstrip('/')}/jobs/{job_id}"
     _send_notification(
         f"Flavum Clipper — {produced} cut(s) ready",
-        f"In {cuts_dir}",
+        f"{cuts_dir}\n{dashboard_url}",
     )
 
 
