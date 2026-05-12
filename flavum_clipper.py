@@ -7,6 +7,9 @@ When you stop a recording, this script:
   3. Uploads the audio to the Flavum Clipper backend
   4. Polls until cut detection finishes
   5. Writes cuts.json into the folder
+  6. (If auto-cut is on) Re-encodes each cut into cuts/cut_NNN.mp4 with the
+     best available hardware encoder, plus a sidecar cut_NNN.txt of titles +
+     description + rationale.
 
 Only audio leaves your machine; the source video stays local.
 
@@ -19,6 +22,7 @@ License: MIT — see LICENSE.
 import hashlib
 import json
 import os
+import platform
 import queue
 import subprocess
 import threading
@@ -63,6 +67,8 @@ _worker_thread = None          # singleton worker (lazy-created)
 
 _pipeline_status = "Idle"      # surfaced in the script properties pane
 _log_queue = queue.Queue()     # worker → main-thread log marshaling
+
+_detected_encoder = None       # cached HW encoder pick (lazy)
 
 
 def _log(message):
@@ -388,8 +394,11 @@ def _process_recording(folder):
         return
 
     (folder / "cuts.json").write_text(json.dumps(cuts, indent=2))
-    cut_count = len(cuts.get("cuts", []))
-    _log(f"{folder.name}: {cut_count} cut(s) saved")
+    cut_list = cuts.get("cuts", [])
+    _log(f"{folder.name}: {len(cut_list)} cut(s) saved")
+
+    if cut_list and _settings["auto_cut"]:
+        _produce_cut_files(folder, recording, cut_list)
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +602,168 @@ def _restore_pending_state():
     if _job_queue:
         _log(f"Resuming {len(_job_queue)} pending recording(s)")
         _ensure_worker_running()
+
+
+# ---------------------------------------------------------------------------
+# FFmpeg cut production (phase 10)
+# ---------------------------------------------------------------------------
+
+# Encoder priority for the "auto" output codec setting. Falls back to libx264
+# (always available) if none of the hardware encoders are present.
+_ENCODER_PRIORITY = (
+    "h264_nvenc",
+    "h264_videotoolbox",
+    "h264_qsv",
+    "h264_amf",
+    "h264_vaapi",
+    "libx264",
+)
+
+# Extra flags appended to `-c:v <encoder>`. Quality knobs are tuned to a
+# reasonable preview default (CRF/CQ ~20). Tweak per-encoder if needed.
+_ENCODER_FLAGS = {
+    "h264_nvenc": ["-preset", "fast", "-cq", "20"],
+    "h264_videotoolbox": ["-b:v", "5M"],
+    "h264_qsv": ["-preset", "fast", "-global_quality", "20"],
+    "h264_amf": ["-quality", "balanced"],
+    "h264_vaapi": ["-qp", "20"],
+    "libx264": ["-preset", "fast", "-crf", "20"],
+}
+
+
+def _pick_video_encoder():
+    """Pick the encoder for cut files. Honors the user's setting unless it's
+    "auto", in which case we probe ffmpeg for available hardware encoders."""
+    global _detected_encoder
+
+    chosen = _settings["output_codec"]
+    if chosen and chosen != "auto":
+        _detected_encoder = chosen
+        return chosen
+
+    if _detected_encoder is not None:
+        return _detected_encoder
+
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        available_blob = result.stdout
+    except Exception as err:  # pylint: disable=broad-except
+        _log(f"Could not probe ffmpeg encoders ({err}); falling back to libx264")
+        _detected_encoder = "libx264"
+        return _detected_encoder
+
+    for encoder in _ENCODER_PRIORITY:
+        if f" {encoder} " in available_blob or f"\n{encoder} " in available_blob:
+            _detected_encoder = encoder
+            _log(f"Using video encoder: {encoder}")
+            return encoder
+
+    _detected_encoder = "libx264"
+    return _detected_encoder
+
+
+def _produce_cut_files(folder, recording_path, cuts):
+    encoder = _pick_video_encoder()
+    encoder_flags = _ENCODER_FLAGS.get(encoder, _ENCODER_FLAGS["libx264"])
+
+    cuts_dir = folder / "cuts"
+    cuts_dir.mkdir(exist_ok=True)
+
+    total = len(cuts)
+    produced = 0
+    for index, cut in enumerate(cuts, start=1):
+        _log(f"Cutting clip {index} of {total} ({encoder})")
+        out_path = cuts_dir / f"cut_{index:03d}.mp4"
+        sidecar_path = cuts_dir / f"cut_{index:03d}.txt"
+
+        cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-ss", str(cut["start"]),
+            "-to", str(cut["end"]),
+            "-i", recording_path,
+            "-c:v", encoder,
+            *encoder_flags,
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            _log(
+                f"Cut {index} failed (exit {result.returncode}): "
+                f"{result.stderr[-300:].strip()}"
+            )
+            continue
+
+        sidecar_path.write_text(_format_sidecar(cut, index))
+        produced += 1
+
+    _log(f"{produced}/{total} cut(s) saved to {cuts_dir}")
+    _send_notification(
+        f"Flavum Clipper — {produced} cut(s) ready",
+        f"In {cuts_dir}",
+    )
+
+
+def _format_sidecar(cut, index):
+    lines = [
+        f"Cut #{index}",
+        f"Time: {cut['start']} → {cut['end']}",
+    ]
+    confidence = cut.get("confidence")
+    if confidence is not None:
+        lines.append(f"Confidence: {confidence:.2f}")
+
+    titles = cut.get("titleSuggestions") or []
+    if titles:
+        lines += ["", "Title suggestions:"]
+        lines += [f"  - {title}" for title in titles]
+
+    description = cut.get("description")
+    if description:
+        lines += ["", "Description:", description]
+
+    tags = cut.get("tags") or []
+    if tags:
+        lines += ["", f"Tags: {', '.join(tags)}"]
+
+    rationale = cut.get("rationale")
+    if rationale:
+        lines += ["", "Why this cut works:", rationale]
+
+    return "\n".join(lines) + "\n"
+
+
+def _send_notification(title, message):
+    system = platform.system()
+    try:
+        if system == "Linux":
+            subprocess.Popen(
+                ["notify-send", title, message],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        elif system == "Darwin":
+            applescript = (
+                f'display notification "{message}" with title "{title}"'
+            )
+            subprocess.Popen(
+                ["osascript", "-e", applescript],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        elif system == "Windows":
+            # MessageBox is intrusive but ubiquitous. A proper Windows toast
+            # needs BurntToast or a similar module — skip for MVP, log
+            # instead so the user still sees it in the OBS scripts log.
+            obs.script_log(obs.LOG_INFO, f"[flavum] {title} — {message}")
+    except FileNotFoundError:
+        # No notification binary available; fall back to the script log.
+        obs.script_log(obs.LOG_INFO, f"[flavum] {title} — {message}")
+    except Exception as err:  # pylint: disable=broad-except
+        obs.script_log(obs.LOG_WARNING, f"[flavum] Notify failed: {err}")
 
 
 # ---------------------------------------------------------------------------
