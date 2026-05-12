@@ -102,11 +102,22 @@ def script_save(settings):
 def script_properties():
     props = obs.obs_properties_create()
 
-    obs.obs_properties_add_text(
+    api_key_prop = obs.obs_properties_add_text(
         props, "api_key", "API key", obs.OBS_TEXT_PASSWORD
     )
-    obs.obs_properties_add_text(
-        props, "backend_url", "Backend URL", obs.OBS_TEXT_DEFAULT
+    obs.obs_property_set_long_description(
+        api_key_prop,
+        "Bearer token used to authenticate uploads. Get one from "
+        "Settings → API keys in the Flavum Clipper dashboard.",
+    )
+
+    backend_url_prop = obs.obs_properties_add_text(
+        props, "backend_url", "Backend", obs.OBS_TEXT_DEFAULT
+    )
+    obs.obs_property_set_long_description(
+        backend_url_prop,
+        "Base URL of the Flavum Clipper webservice. Defaults to a "
+        "local dev server; change for production.",
     )
 
     obs.obs_properties_add_button(
@@ -116,21 +127,34 @@ def script_properties():
         props, "_test_status", _test_status, obs.OBS_TEXT_INFO
     )
 
-    obs.obs_properties_add_bool(
-        props, "auto_process", "Auto-process recordings when they stop"
+    auto_process_prop = obs.obs_properties_add_bool(
+        props, "auto_process", "Auto-process"
     )
-    obs.obs_properties_add_bool(
-        props,
-        "auto_cut",
-        "Auto-cut clips after analysis (re-encoded, HW-accelerated)",
+    obs.obs_property_set_long_description(
+        auto_process_prop,
+        "When a recording stops, extract audio and upload it to the "
+        "backend automatically. Off → manual trigger only.",
+    )
+
+    auto_cut_prop = obs.obs_properties_add_bool(
+        props, "auto_cut", "Auto-cut clips"
+    )
+    obs.obs_property_set_long_description(
+        auto_cut_prop,
+        "After cuts are detected, run FFmpeg to produce video clips. "
+        "Off → just save cuts.json next to the recording.",
     )
 
     language_list = obs.obs_properties_add_list(
         props,
         "language_hint",
-        "Language hint",
+        "Language",
         obs.OBS_COMBO_TYPE_LIST,
         obs.OBS_COMBO_FORMAT_STRING,
+    )
+    obs.obs_property_set_long_description(
+        language_list,
+        "Hint passed to the transcriber. Auto-detect works in most cases.",
     )
     for label, value in [
         ("Auto-detect", "auto"),
@@ -140,21 +164,25 @@ def script_properties():
     ]:
         obs.obs_property_list_add_string(language_list, label, value)
 
-    obs.obs_properties_add_int_slider(
-        props,
-        "target_long_cut_minutes",
-        "Target long-cut length (minutes)",
-        1,
-        15,
-        1,
+    cut_length_prop = obs.obs_properties_add_int_slider(
+        props, "target_long_cut_minutes", "Cut length (min)", 1, 15, 1
+    )
+    obs.obs_property_set_long_description(
+        cut_length_prop,
+        "Target length the AI aims for when picking long-form cuts.",
     )
 
     bitrate_list = obs.obs_properties_add_list(
         props,
         "audio_bitrate_kbps",
-        "Upload audio bitrate (kbps)",
+        "Upload bitrate",
         obs.OBS_COMBO_TYPE_LIST,
         obs.OBS_COMBO_FORMAT_INT,
+    )
+    obs.obs_property_set_long_description(
+        bitrate_list,
+        "Bitrate used when extracting audio for upload. 32 kbps is "
+        "plenty for transcription; lower = smaller upload.",
     )
     for kbps in (16, 32, 64):
         obs.obs_property_list_add_int(bitrate_list, f"{kbps} kbps", kbps)
@@ -162,18 +190,23 @@ def script_properties():
     codec_list = obs.obs_properties_add_list(
         props,
         "output_codec",
-        "Cut output codec",
+        "Output codec",
         obs.OBS_COMBO_TYPE_LIST,
         obs.OBS_COMBO_FORMAT_STRING,
     )
+    obs.obs_property_set_long_description(
+        codec_list,
+        "Video codec FFmpeg uses when producing cut files. "
+        "Auto-detect picks the best hardware encoder available.",
+    )
     for label, value in [
-        ("Auto-detect (recommended)", "auto"),
+        ("Auto-detect", "auto"),
         ("NVIDIA NVENC", "h264_nvenc"),
         ("Apple VideoToolbox", "h264_videotoolbox"),
         ("Intel QuickSync", "h264_qsv"),
         ("Linux VAAPI", "h264_vaapi"),
         ("AMD AMF", "h264_amf"),
-        ("CPU libx264 (fallback)", "libx264"),
+        ("CPU libx264", "libx264"),
     ]:
         obs.obs_property_list_add_string(codec_list, label, value)
 
