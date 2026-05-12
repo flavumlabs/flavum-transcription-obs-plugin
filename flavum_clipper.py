@@ -1,28 +1,40 @@
 """
-Flavum Clipper — OBS Python script (phase 8 scaffold).
+Flavum Clipper — OBS Python script.
 
-Connects OBS to the Flavum Clipper backend. Upcoming phases (9, 10) add
-recording hooks, audio extraction, upload, polling, and FFmpeg cutting.
-Phase 8 just gets the settings dialog + a working "Test connection" call.
+When you stop a recording, this script:
+  1. Creates a sibling folder RECORDING-YYYY-MM-DD-HHMMSS/
+  2. Extracts audio with FFmpeg (mono Opus, configurable bitrate)
+  3. Uploads the audio to the Flavum Clipper backend
+  4. Polls until cut detection finishes
+  5. Writes cuts.json into the folder
 
-Audio leaves the machine; the source video stays local.
+Only audio leaves your machine; the source video stays local.
+
+Pending jobs survive OBS restart — they're persisted to
+~/.config/flavum-clipper/pending.json and resumed on script_load.
 
 License: MIT — see LICENSE.
 """
 
+import hashlib
 import json
+import os
+import queue
+import subprocess
+import threading
+import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
 
 import obspython as obs
 
 
 # ---------------------------------------------------------------------------
-# Module state
+# Settings (mirrored from OBS on script_update)
 # ---------------------------------------------------------------------------
 
-# Settings are mirrored here from OBS on script_update so the button callback
-# (which receives no settings argument) can read the latest values.
 _settings = {
     "api_key": "",
     "backend_url": "http://localhost:4500",
@@ -35,6 +47,43 @@ _settings = {
 }
 
 _test_status = 'Click "Test connection" once you\'ve pasted an API key.'
+
+
+# ---------------------------------------------------------------------------
+# Pipeline state
+# ---------------------------------------------------------------------------
+
+_state_dir = Path.home() / ".config" / "flavum-clipper"
+_state_file = _state_dir / "pending.json"
+
+_queue_lock = threading.Lock()
+_job_queue = []                # list of recording-folder paths waiting to process
+_current_folder = None         # folder currently being processed (or None)
+_worker_thread = None          # singleton worker (lazy-created)
+
+_pipeline_status = "Idle"      # surfaced in the script properties pane
+_log_queue = queue.Queue()     # worker → main-thread log marshaling
+
+
+def _log(message):
+    """Thread-safe pipeline log + status update.
+
+    OBS's API is not thread-safe, so we enqueue the line here and drain it
+    from a main-thread timer (`_drain_log_queue`).
+    """
+    global _pipeline_status
+    _pipeline_status = message
+    _log_queue.put(message)
+
+
+def _drain_log_queue():
+    """Main-thread timer callback — emits queued log lines to OBS."""
+    while True:
+        try:
+            line = _log_queue.get_nowait()
+        except queue.Empty:
+            return
+        obs.script_log(obs.LOG_INFO, f"[flavum] {line}")
 
 
 # ---------------------------------------------------------------------------
@@ -86,16 +135,18 @@ def script_update(settings):
 
 
 def script_load(settings):
-    # Recording hooks will be registered here in phase 9.
-    pass
+    obs.obs_frontend_add_event_callback(_on_frontend_event)
+    obs.timer_add(_drain_log_queue, 500)
+    _state_dir.mkdir(parents=True, exist_ok=True)
+    _restore_pending_state()
 
 
 def script_unload():
-    pass
+    obs.timer_remove(_drain_log_queue)
+    obs.obs_frontend_remove_event_callback(_on_frontend_event)
 
 
 def script_save(settings):
-    # OBS auto-persists property values. Nothing extra to do.
     pass
 
 
@@ -125,6 +176,13 @@ def script_properties():
     )
     obs.obs_properties_add_text(
         props, "_test_status", _test_status, obs.OBS_TEXT_INFO
+    )
+
+    obs.obs_properties_add_text(
+        props,
+        "_pipeline_status",
+        f"Pipeline: {_pipeline_status}",
+        obs.OBS_TEXT_INFO,
     )
 
     auto_process_prop = obs.obs_properties_add_bool(
@@ -214,7 +272,331 @@ def script_properties():
 
 
 # ---------------------------------------------------------------------------
-# Test connection
+# Frontend events
+# ---------------------------------------------------------------------------
+
+
+def _on_frontend_event(event):
+    if event == obs.OBS_FRONTEND_EVENT_RECORDING_STARTED:
+        _log("Recording started")
+    elif event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED:
+        _handle_recording_stopped()
+    elif event == obs.OBS_FRONTEND_EVENT_EXIT:
+        _log("OBS exiting; pending jobs will resume on next launch")
+
+
+def _handle_recording_stopped():
+    if not _settings["auto_process"]:
+        _log("Recording stopped; auto-process is disabled")
+        return
+
+    recording_path = obs.obs_frontend_get_last_recording()
+    if not recording_path:
+        _log("No last-recording path available; skipping")
+        return
+
+    started_at = datetime.now(timezone.utc)
+    folder = _make_recording_folder(recording_path, started_at)
+    manifest = {
+        "originalRecording": recording_path,
+        "stoppedAt": started_at.isoformat(),
+        "folder": str(folder),
+    }
+    (folder / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    _enqueue(folder)
+
+
+def _make_recording_folder(recording_path, when):
+    parent = Path(recording_path).parent
+    stamp = when.strftime("%Y-%m-%d-%H%M%S")
+    folder = parent / f"RECORDING-{stamp}"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _enqueue(folder):
+    with _queue_lock:
+        _job_queue.append(str(folder))
+    _save_pending_state()
+    _log(f"Queued: {folder.name}")
+    _ensure_worker_running()
+
+
+# ---------------------------------------------------------------------------
+# Worker thread
+# ---------------------------------------------------------------------------
+
+
+def _ensure_worker_running():
+    global _worker_thread
+    if _worker_thread is None or not _worker_thread.is_alive():
+        _worker_thread = threading.Thread(
+            target=_worker_loop, name="flavum-clipper-worker", daemon=True
+        )
+        _worker_thread.start()
+
+
+def _worker_loop():
+    global _current_folder
+    while True:
+        with _queue_lock:
+            if not _job_queue:
+                _current_folder = None
+                _log("Idle")
+                return
+            _current_folder = _job_queue[0]
+
+        folder = Path(_current_folder)
+        try:
+            _process_recording(folder)
+        except Exception as err:  # pylint: disable=broad-except
+            _log(f"Pipeline error for {folder.name}: {err}")
+        finally:
+            with _queue_lock:
+                if _job_queue and _job_queue[0] == _current_folder:
+                    _job_queue.pop(0)
+            _save_pending_state()
+
+
+def _process_recording(folder):
+    manifest_path = folder / "manifest.json"
+    if not manifest_path.exists():
+        _log(f"Missing manifest in {folder.name}; dropping")
+        return
+
+    manifest = json.loads(manifest_path.read_text())
+    recording = manifest.get("originalRecording")
+    if not recording or not Path(recording).exists():
+        _log(f"Source recording missing for {folder.name}; dropping")
+        return
+
+    audio_path = folder / "audio.opus"
+    if not audio_path.exists():
+        _log(f"Extracting audio from {Path(recording).name}")
+        _extract_audio(recording, audio_path)
+
+    duration = _ffprobe_duration(audio_path)
+    sha = _sha256_file(audio_path)
+
+    audio_kb = audio_path.stat().st_size // 1024
+    _log(f"Uploading {audio_path.name} ({audio_kb} KB)")
+    job_id = _upload_audio(audio_path, sha, duration)
+
+    _log(f"Job {job_id} queued; polling")
+    cuts = _poll_until_done(job_id)
+    if cuts is None:
+        return
+
+    (folder / "cuts.json").write_text(json.dumps(cuts, indent=2))
+    cut_count = len(cuts.get("cuts", []))
+    _log(f"{folder.name}: {cut_count} cut(s) saved")
+
+
+# ---------------------------------------------------------------------------
+# FFmpeg helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_audio(recording_path, audio_path):
+    bitrate = _settings["audio_bitrate_kbps"]
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i", recording_path,
+            "-vn",
+            "-acodec", "libopus",
+            "-b:a", f"{bitrate}k",
+            "-ac", "1",
+            str(audio_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg extract failed (exit {result.returncode}): "
+            f"{result.stderr[-400:].strip()}"
+        )
+
+
+def _ffprobe_duration(audio_path):
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffprobe failed (exit {result.returncode}): "
+            f"{result.stderr.strip()}"
+        )
+    return float(result.stdout.strip())
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Upload + poll
+# ---------------------------------------------------------------------------
+
+
+def _build_multipart(audio_path, sha, duration):
+    boundary = "----flavum" + os.urandom(8).hex()
+    sep = f"--{boundary}".encode()
+    end = f"--{boundary}--".encode()
+    crlf = b"\r\n"
+
+    metadata = {"audioDurationSec": duration}
+    language = _settings["language_hint"]
+    if language and language != "auto":
+        metadata["languageHint"] = language
+    metadata["options"] = {
+        "targetLongCutMinutes": _settings["target_long_cut_minutes"],
+    }
+
+    parts = []
+
+    def push_text(name, value):
+        parts.append(sep)
+        parts.append(
+            f'Content-Disposition: form-data; name="{name}"'.encode()
+        )
+        parts.append(b"")
+        parts.append(str(value).encode())
+
+    push_text("audioSha256", sha)
+    push_text("metadata", json.dumps(metadata))
+
+    parts.append(sep)
+    parts.append(
+        (
+            f'Content-Disposition: form-data; name="audio"; '
+            f'filename="{audio_path.name}"'
+        ).encode()
+    )
+    parts.append(b"Content-Type: audio/opus")
+    parts.append(b"")
+
+    body = crlf.join(parts) + crlf
+    with open(audio_path, "rb") as handle:
+        body += handle.read()
+    body += crlf + end + crlf
+
+    return body, boundary
+
+
+def _upload_audio(audio_path, sha, duration):
+    backend = _settings["backend_url"].rstrip("/")
+    body, boundary = _build_multipart(audio_path, sha, duration)
+    req = urllib.request.Request(
+        f"{backend}/api/v1/jobs",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {_settings['api_key']}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            return json.loads(resp.read())["jobId"]
+    except urllib.error.HTTPError as err:
+        # 409 = duplicate (same audioSha256). Body still contains existing jobId.
+        if err.code == 409:
+            payload = json.loads(err.read())
+            return payload["jobId"]
+        raise
+
+
+def _poll_until_done(job_id, max_seconds=1800):
+    backend = _settings["backend_url"].rstrip("/")
+    headers = {"Authorization": f"Bearer {_settings['api_key']}"}
+    deadline = time.time() + max_seconds
+    last_status = None
+
+    while time.time() < deadline:
+        req = urllib.request.Request(
+            f"{backend}/api/v1/jobs/{job_id}", headers=headers
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            doc = json.loads(resp.read())
+
+        status = doc["status"]
+        if status != last_status:
+            _log(f"Job {job_id}: {status}")
+            last_status = status
+
+        if status == "COMPLETE":
+            result_req = urllib.request.Request(
+                f"{backend}/api/v1/jobs/{job_id}/result", headers=headers
+            )
+            with urllib.request.urlopen(result_req, timeout=30) as resp:
+                return json.loads(resp.read())
+
+        if status in ("FAILED", "CANCELLED"):
+            _log(f"Job {job_id} {status.lower()}: {doc.get('error', '')}")
+            return None
+
+        time.sleep(5)
+
+    _log(f"Job {job_id} polling timed out")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# State persistence — survive OBS restart with pending recordings
+# ---------------------------------------------------------------------------
+
+
+def _save_pending_state():
+    payload = {"pendingFolders": list(_job_queue)}
+    try:
+        _state_file.write_text(json.dumps(payload, indent=2))
+    except OSError as err:
+        obs.script_log(
+            obs.LOG_WARNING, f"[flavum] could not save state: {err}"
+        )
+
+
+def _restore_pending_state():
+    global _job_queue
+    if not _state_file.exists():
+        return
+    try:
+        payload = json.loads(_state_file.read_text())
+    except (OSError, json.JSONDecodeError) as err:
+        obs.script_log(
+            obs.LOG_WARNING, f"[flavum] could not load state: {err}"
+        )
+        return
+
+    with _queue_lock:
+        _job_queue = [
+            folder
+            for folder in payload.get("pendingFolders", [])
+            if Path(folder).is_dir()
+        ]
+
+    if _job_queue:
+        _log(f"Resuming {len(_job_queue)} pending recording(s)")
+        _ensure_worker_running()
+
+
+# ---------------------------------------------------------------------------
+# Test connection (phase 8)
 # ---------------------------------------------------------------------------
 
 
@@ -254,7 +636,7 @@ def _check_account(api_key, backend_url):
         return f"Backend error: HTTP {err.code}"
     except urllib.error.URLError as err:
         return f"Cannot reach backend at {backend_url}: {err.reason}"
-    except Exception as err:
+    except Exception as err:  # pylint: disable=broad-except
         return f"Unexpected error: {err}"
 
     email = body.get("email", "(unknown email)")
