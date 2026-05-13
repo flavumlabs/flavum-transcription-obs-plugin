@@ -37,6 +37,17 @@ from pathlib import Path
 import obspython as obs
 
 
+# Plugin version sent on every backend request via the
+# X-Flavum-Plugin-Version header. The backend checks this against its own
+# MIN_SUPPORTED_PLUGIN_VERSION and returns HTTP 426 if we're too old, in
+# which case _handle_outdated_plugin surfaces a clear "update the script"
+# message into the OBS log. Bump this whenever a release tag goes out so
+# the version reported matches the file the user downloaded.
+PLUGIN_VERSION = "0.2.0"
+
+PLUGIN_VERSION_HEADER = "X-Flavum-Plugin-Version"
+
+
 # ---------------------------------------------------------------------------
 # Settings (mirrored from OBS on script_update)
 # ---------------------------------------------------------------------------
@@ -357,6 +368,8 @@ def _worker_loop():
         folder = Path(_current_folder)
         try:
             _process_recording(folder)
+        except _OutdatedPluginError as err:
+            _log(str(err))
         except Exception as err:  # pylint: disable=broad-except
             _log(f"Pipeline error for {folder.name}: {err}")
         finally:
@@ -463,6 +476,38 @@ def _sha256_file(path):
 # ---------------------------------------------------------------------------
 
 
+def _auth_headers():
+    """Headers every backend request sends. Authorization carries the API key;
+    the plugin-version header lets the backend refuse requests from clients
+    that pre-date its current compatibility floor."""
+    return {
+        "Authorization": f"Bearer {_settings['api_key']}",
+        PLUGIN_VERSION_HEADER: PLUGIN_VERSION,
+    }
+
+
+def _format_outdated_plugin_message(body_bytes):
+    """Pretty-print the backend's 426 'plugin_outdated' payload for the
+    OBS log. Falls back to a generic message if the body isn't shaped as
+    expected (e.g., a load balancer returned a 426 for a different reason)."""
+    try:
+        payload = json.loads(body_bytes)
+    except (ValueError, TypeError):
+        payload = {}
+    min_version = payload.get("minVersion", "unknown")
+    install_url = payload.get("installUrl", "")
+    suffix = f" Visit {install_url} to update." if install_url else ""
+    return (
+        f"Flavum Clipper plugin v{PLUGIN_VERSION} is out of date. "
+        f"The backend requires v{min_version} or newer.{suffix}"
+    )
+
+
+class _OutdatedPluginError(Exception):
+    """Raised when the backend rejects us with HTTP 426. Caller catches and
+    surfaces the message; we don't retry."""
+
+
 def _build_multipart_envelope(sha, metadata_json, audio_filename, audio_content_type):
     """Builds the multipart header (everything before the audio bytes) and
     trailer (everything after) for the upload. The audio file is streamed
@@ -533,7 +578,8 @@ def _upload_audio(audio_path, sha, duration):
     try:
         path = (parsed.path or "").rstrip("/") + "/api/v1/jobs"
         conn.putrequest("POST", path)
-        conn.putheader("Authorization", f"Bearer {_settings['api_key']}")
+        for name, value in _auth_headers().items():
+            conn.putheader(name, value)
         conn.putheader(
             "Content-Type", f"multipart/form-data; boundary={boundary}"
         )
@@ -549,6 +595,8 @@ def _upload_audio(audio_path, sha, duration):
         response = conn.getresponse()
         body_bytes = response.read()
 
+        if response.status == 426:
+            raise _OutdatedPluginError(_format_outdated_plugin_message(body_bytes))
         if response.status == 409:
             # Duplicate (same audioSha256); body has the existing jobId.
             return json.loads(body_bytes)["jobId"]
@@ -570,16 +618,22 @@ def _upload_audio(audio_path, sha, duration):
 
 def _poll_until_done(job_id, max_seconds=1800):
     backend = _settings["backend_url"].rstrip("/")
-    headers = {"Authorization": f"Bearer {_settings['api_key']}"}
+    headers = _auth_headers()
     deadline = time.time() + max_seconds
     last_status = None
 
     while time.time() < deadline:
-        req = urllib.request.Request(
-            f"{backend}/api/v1/jobs/{job_id}", headers=headers
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            doc = json.loads(resp.read())
+        try:
+            req = urllib.request.Request(
+                f"{backend}/api/v1/jobs/{job_id}", headers=headers
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                doc = json.loads(resp.read())
+        except urllib.error.HTTPError as err:
+            if err.code == 426:
+                _log(_format_outdated_plugin_message(err.read()))
+                return None
+            raise
 
         status = doc["status"]
         if status != last_status:
@@ -587,11 +641,17 @@ def _poll_until_done(job_id, max_seconds=1800):
             last_status = status
 
         if status == "COMPLETE":
-            result_req = urllib.request.Request(
-                f"{backend}/api/v1/jobs/{job_id}/result", headers=headers
-            )
-            with urllib.request.urlopen(result_req, timeout=30) as resp:
-                return json.loads(resp.read())
+            try:
+                result_req = urllib.request.Request(
+                    f"{backend}/api/v1/jobs/{job_id}/result", headers=headers
+                )
+                with urllib.request.urlopen(result_req, timeout=30) as resp:
+                    return json.loads(resp.read())
+            except urllib.error.HTTPError as err:
+                if err.code == 426:
+                    _log(_format_outdated_plugin_message(err.read()))
+                    return None
+                raise
 
         if status in ("FAILED", "CANCELLED"):
             _log(f"Job {job_id} {status.lower()}: {doc.get('error', '')}")
@@ -837,7 +897,10 @@ def _check_account(api_key, backend_url):
     url = f"{backend_url}/api/v1/account"
     req = urllib.request.Request(
         url,
-        headers={"Authorization": f"Bearer {api_key}"},
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            PLUGIN_VERSION_HEADER: PLUGIN_VERSION,
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -847,6 +910,8 @@ def _check_account(api_key, backend_url):
             return "Authentication failed. Check your API key."
         if err.code == 402:
             return "Out of credits. Upgrade your plan to continue."
+        if err.code == 426:
+            return _format_outdated_plugin_message(err.read())
         return f"Backend error: HTTP {err.code}"
     except urllib.error.URLError as err:
         return f"Cannot reach backend at {backend_url}: {err.reason}"
