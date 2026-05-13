@@ -41,7 +41,7 @@ import obspython as obs
 
 _settings = {
     "api_key": "",
-    "backend_url": "http://localhost:4500",
+    "backend_url": "https://clipper.flavumlabs.com",
     "auto_process": True,
     "auto_cut": True,
     "language_hint": "auto",
@@ -111,7 +111,7 @@ def script_description():
 def script_defaults(settings):
     obs.obs_data_set_default_string(settings, "api_key", "")
     obs.obs_data_set_default_string(
-        settings, "backend_url", "http://localhost:4500"
+        settings, "backend_url", "https://clipper.flavumlabs.com"
     )
     obs.obs_data_set_default_bool(settings, "auto_process", True)
     obs.obs_data_set_default_bool(settings, "auto_cut", True)
