@@ -20,6 +20,7 @@ License: MIT — see LICENSE.
 """
 
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -28,6 +29,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -461,19 +463,16 @@ def _sha256_file(path):
 # ---------------------------------------------------------------------------
 
 
-def _build_multipart(audio_path, sha, duration):
+def _build_multipart_envelope(sha, metadata_json, audio_filename, audio_content_type):
+    """Builds the multipart header (everything before the audio bytes) and
+    trailer (everything after) for the upload. The audio file is streamed
+    between them in _upload_audio so we never hold the full recording in
+    memory — a marathon multi-hour capture would otherwise OOM OBS on
+    machines with tight RAM headroom."""
     boundary = "----flavum" + os.urandom(8).hex()
     sep = f"--{boundary}".encode()
     end = f"--{boundary}--".encode()
     crlf = b"\r\n"
-
-    metadata = {"audioDurationSec": duration}
-    language = _settings["language_hint"]
-    if language and language != "auto":
-        metadata["languageHint"] = language
-    metadata["options"] = {
-        "targetLongCutMinutes": _settings["target_long_cut_minutes"],
-    }
 
     parts = []
 
@@ -486,48 +485,87 @@ def _build_multipart(audio_path, sha, duration):
         parts.append(str(value).encode())
 
     push_text("audioSha256", sha)
-    push_text("metadata", json.dumps(metadata))
+    push_text("metadata", metadata_json)
 
     parts.append(sep)
     parts.append(
         (
             f'Content-Disposition: form-data; name="audio"; '
-            f'filename="{audio_path.name}"'
+            f'filename="{audio_filename}"'
         ).encode()
     )
-    parts.append(b"Content-Type: audio/opus")
+    parts.append(f"Content-Type: {audio_content_type}".encode())
     parts.append(b"")
 
-    body = crlf.join(parts) + crlf
-    with open(audio_path, "rb") as handle:
-        body += handle.read()
-    body += crlf + end + crlf
-
-    return body, boundary
+    header = crlf.join(parts) + crlf
+    trailer = crlf + end + crlf
+    return header, trailer, boundary
 
 
 def _upload_audio(audio_path, sha, duration):
     backend = _settings["backend_url"].rstrip("/")
-    body, boundary = _build_multipart(audio_path, sha, duration)
-    req = urllib.request.Request(
-        f"{backend}/api/v1/jobs",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {_settings['api_key']}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Content-Length": str(len(body)),
-        },
-        method="POST",
+    parsed = urllib.parse.urlparse(backend)
+
+    metadata = {"audioDurationSec": duration}
+    language = _settings["language_hint"]
+    if language and language != "auto":
+        metadata["languageHint"] = language
+    metadata["options"] = {
+        "targetLongCutMinutes": _settings["target_long_cut_minutes"],
+    }
+
+    header_bytes, trailer_bytes, boundary = _build_multipart_envelope(
+        sha=sha,
+        metadata_json=json.dumps(metadata),
+        audio_filename=audio_path.name,
+        audio_content_type="audio/opus",
     )
+    audio_size = audio_path.stat().st_size
+    content_length = len(header_bytes) + audio_size + len(trailer_bytes)
+
+    is_https = parsed.scheme == "https"
+    port = parsed.port or (443 if is_https else 80)
+    conn_class = (
+        http.client.HTTPSConnection if is_https else http.client.HTTPConnection
+    )
+    conn = conn_class(parsed.hostname, port, timeout=300)
+
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            return json.loads(resp.read())["jobId"]
-    except urllib.error.HTTPError as err:
-        # 409 = duplicate (same audioSha256). Body still contains existing jobId.
-        if err.code == 409:
-            payload = json.loads(err.read())
-            return payload["jobId"]
-        raise
+        path = (parsed.path or "").rstrip("/") + "/api/v1/jobs"
+        conn.putrequest("POST", path)
+        conn.putheader("Authorization", f"Bearer {_settings['api_key']}")
+        conn.putheader(
+            "Content-Type", f"multipart/form-data; boundary={boundary}"
+        )
+        conn.putheader("Content-Length", str(content_length))
+        conn.endheaders()
+
+        conn.send(header_bytes)
+        with open(audio_path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(64 * 1024), b""):
+                conn.send(chunk)
+        conn.send(trailer_bytes)
+
+        response = conn.getresponse()
+        body_bytes = response.read()
+
+        if response.status == 409:
+            # Duplicate (same audioSha256); body has the existing jobId.
+            return json.loads(body_bytes)["jobId"]
+        if 200 <= response.status < 300:
+            return json.loads(body_bytes)["jobId"]
+
+        # Match the urllib.error.HTTPError shape the caller used to see — keeps
+        # downstream `except urllib.error.HTTPError` blocks working.
+        raise urllib.error.HTTPError(
+            f"{backend}/api/v1/jobs",
+            response.status,
+            response.reason or "",
+            response.getheaders(),
+            None,
+        )
+    finally:
+        conn.close()
 
 
 def _poll_until_done(job_id, max_seconds=1800):
