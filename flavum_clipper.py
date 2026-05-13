@@ -43,7 +43,7 @@ import obspython as obs
 # which case _handle_outdated_plugin surfaces a clear "update the script"
 # message into the OBS log. Bump this whenever a release tag goes out so
 # the version reported matches the file the user downloaded.
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.3.0"
 
 PLUGIN_VERSION_HEADER = "X-Flavum-Plugin-Version"
 
@@ -57,6 +57,7 @@ _settings = {
     "backend_url": "https://clipper.flavumlabs.com",
     "auto_process": True,
     "auto_cut": True,
+    "generate_shorts": False,
     "language_hint": "auto",
     "target_long_cut_minutes": 8,
     "audio_bitrate_kbps": 32,
@@ -128,6 +129,7 @@ def script_defaults(settings):
     )
     obs.obs_data_set_default_bool(settings, "auto_process", True)
     obs.obs_data_set_default_bool(settings, "auto_cut", True)
+    obs.obs_data_set_default_bool(settings, "generate_shorts", False)
     obs.obs_data_set_default_string(settings, "language_hint", "auto")
     obs.obs_data_set_default_int(settings, "target_long_cut_minutes", 8)
     obs.obs_data_set_default_int(settings, "audio_bitrate_kbps", 32)
@@ -139,6 +141,9 @@ def script_update(settings):
     _settings["backend_url"] = obs.obs_data_get_string(settings, "backend_url")
     _settings["auto_process"] = obs.obs_data_get_bool(settings, "auto_process")
     _settings["auto_cut"] = obs.obs_data_get_bool(settings, "auto_cut")
+    _settings["generate_shorts"] = obs.obs_data_get_bool(
+        settings, "generate_shorts"
+    )
     _settings["language_hint"] = obs.obs_data_get_string(
         settings, "language_hint"
     )
@@ -220,6 +225,16 @@ def script_properties():
         auto_cut_prop,
         "After cuts are detected, run FFmpeg to produce video clips. "
         "Off → just save cuts.json next to the recording.",
+    )
+
+    shorts_prop = obs.obs_properties_add_bool(
+        props, "generate_shorts", "Also generate shorts"
+    )
+    obs.obs_property_set_long_description(
+        shorts_prop,
+        "Ask the AI to pick punchy 15–60 second moments alongside the long "
+        "cuts. Shorts are saved as short_NNN.mp4 next to cut_NNN.mp4, at the "
+        "source aspect ratio (no cropping — pick your own frame later).",
     )
 
     language_list = obs.obs_properties_add_list(
@@ -557,6 +572,7 @@ def _upload_audio(audio_path, sha, duration):
         metadata["languageHint"] = language
     metadata["options"] = {
         "targetLongCutMinutes": _settings["target_long_cut_minutes"],
+        "generateShorts": _settings["generate_shorts"],
     }
 
     header_bytes, trailer_bytes, boundary = _build_multipart_envelope(
@@ -770,44 +786,69 @@ def _produce_cut_files(folder, recording_path, cuts, job_id):
     cuts_dir = folder / "cuts"
     cuts_dir.mkdir(exist_ok=True)
 
-    total = len(cuts)
-    produced = 0
-    for index, cut in enumerate(cuts, start=1):
-        _log(f"Cutting clip {index} of {total} ({encoder})")
-        out_path = cuts_dir / f"cut_{index:03d}.mp4"
-        sidecar_path = cuts_dir / f"cut_{index:03d}.txt"
+    # Long cuts and shorts get separate filename prefixes + independent
+    # numbering so the user can tell at a glance which file is which. Both
+    # use the same source aspect ratio (whatever was recorded) — no cropping.
+    long_cuts = [c for c in cuts if c.get("type") != "short"]
+    shorts = [c for c in cuts if c.get("type") == "short"]
 
-        cmd = [
-            "ffmpeg", "-hide_banner", "-y",
-            "-ss", str(cut["start"]),
-            "-to", str(cut["end"]),
-            "-i", recording_path,
-            "-c:v", encoder,
-            *encoder_flags,
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-movflags", "+faststart",
-            str(out_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            _log(
-                f"Cut {index} failed (exit {result.returncode}): "
-                f"{result.stderr[-300:].strip()}"
-            )
-            continue
+    def _produce_group(group, prefix, label):
+        total = len(group)
+        produced = 0
+        for index, cut in enumerate(group, start=1):
+            _log(f"Cutting {label} {index} of {total} ({encoder})")
+            out_path = cuts_dir / f"{prefix}_{index:03d}.mp4"
+            sidecar_path = cuts_dir / f"{prefix}_{index:03d}.txt"
 
-        sidecar_path.write_text(_format_sidecar(cut, index))
-        produced += 1
+            cmd = [
+                "ffmpeg", "-hide_banner", "-y",
+                "-ss", str(cut["start"]),
+                "-to", str(cut["end"]),
+                "-i", recording_path,
+                "-c:v", encoder,
+                *encoder_flags,
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                str(out_path),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                _log(
+                    f"{label.capitalize()} {index} failed "
+                    f"(exit {result.returncode}): "
+                    f"{result.stderr[-300:].strip()}"
+                )
+                continue
 
-    _log(f"{produced}/{total} cut(s) saved to {cuts_dir}")
+            sidecar_path.write_text(_format_sidecar(cut, index))
+            produced += 1
+        return produced, total
+
+    long_produced, long_total = _produce_group(long_cuts, "cut", "clip")
+    shorts_produced, shorts_total = _produce_group(shorts, "short", "short")
+    total_produced = long_produced + shorts_produced
+    total_count = long_total + shorts_total
+
+    summary = (
+        f"{long_produced}/{long_total} cut(s)"
+        + (f", {shorts_produced}/{shorts_total} short(s)" if shorts_total else "")
+        + f" saved to {cuts_dir}"
+    )
+    _log(summary)
 
     # Notification body includes both the local cuts folder and the dashboard
     # URL so the user can either open the files directly or jump into the
     # rich review UI to play/edit.
     dashboard_url = f"{_settings['backend_url'].rstrip('/')}/jobs/{job_id}"
+    headline_parts = []
+    if long_produced:
+        headline_parts.append(f"{long_produced} cut(s)")
+    if shorts_produced:
+        headline_parts.append(f"{shorts_produced} short(s)")
+    headline = ", ".join(headline_parts) or f"{total_produced} clip(s)"
     _send_notification(
-        f"Flavum Clipper — {produced} cut(s) ready",
+        f"Flavum Clipper — {headline} ready",
         f"{cuts_dir}\n{dashboard_url}",
     )
 
